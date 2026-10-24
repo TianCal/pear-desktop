@@ -24,6 +24,7 @@ import type {
   SlimQueueItem,
   SlimQueueResponse,
 } from '@/providers/song-controls';
+import type { QueueItem } from '@/types/datahost-get-state';
 import type { MusicPlayer } from '@/types/music-player';
 import type { MusicPlayerAppElement } from '@/types/music-player-app-element';
 import type { QueueResponse } from '@/types/music-player-desktop-internal';
@@ -50,6 +51,111 @@ async function listenForApiLoad() {
     }
   }
 }
+
+/** Queue items come either bare or wrapped; unwrap to the video renderer. */
+const queueRenderer = (item?: QueueItem) =>
+  item?.playlistPanelVideoRenderer ??
+  item?.playlistPanelVideoWrapperRenderer?.primaryRenderer
+    .playlistPanelVideoRenderer;
+
+/** Resolves true once `check` passes, or false after `timeout` ms. */
+const waitFor = async (check: () => boolean, timeout: number) => {
+  const until = performance.now() + timeout;
+  while (performance.now() < until) {
+    if (check()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return check();
+};
+
+/** A playlist's tracks in order, as queue items; empty if it has none. */
+const fetchPlaylist = async (
+  app: MusicPlayerAppElement,
+  playlistId: string,
+) => {
+  const result = await app.networkManager
+    .fetch<unknown, { playlistId: string }>('/music/get_queue', { playlistId })
+    .catch(() => null);
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    !('queueDatas' in result) ||
+    !Array.isArray(result.queueDatas)
+  ) {
+    return [];
+  }
+  return result.queueDatas
+    .map((it) =>
+      typeof it === 'object' && it && 'content' in it
+        ? (it.content as QueueItem)
+        : null,
+    )
+    .filter((it): it is QueueItem => it !== null);
+};
+
+/**
+ * Turning shuffle off rebuilds the queue as a window around the playing
+ * track: 50 tracks before it and the rest after. On a longer playlist the
+ * opening tracks are simply gone, so the queue no longer starts where the
+ * playlist does. Put them back in front, which leaves the playing track and
+ * playback untouched.
+ */
+/** Tracks YouTube Music keeps before the playing one when it unshuffles. */
+const UNSHUFFLE_WINDOW_BEFORE = 50;
+
+const restorePlaylistHead = async () => {
+  const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+  const queue = document.querySelector<QueueElement>('#queue');
+  if (!app || !queue) return;
+  const store = queue.queue.store.store;
+  const firstId = () => queueRenderer(store.getState().queue.items[0])?.videoId;
+
+  const shuffledFirst = firstId();
+  const rebuilt = await waitFor(() => {
+    const state = store.getState().queue;
+    return !state.shuffleEnabled && firstId() !== shuffledFirst;
+  }, 5000);
+  if (!rebuilt) return;
+
+  const items = store.getState().queue.items.map(queueRenderer);
+  const playingAt = items.findIndex((it) => it?.selected);
+  // The window keeps this many tracks before the playing one, so with fewer
+  // in front of it the queue already starts at the top: nothing to fetch.
+  if (playingAt < UNSHUFFLE_WINDOW_BEFORE) return;
+  const playlistId =
+    items[playingAt]?.navigationEndpoint?.watchEndpoint?.playlistId;
+  // Radios and mixes are generated as they go and have no first track.
+  if (!playlistId || playlistId.startsWith('RD')) return;
+
+  // When YouTube caps a very long playlist below the window, the window's
+  // first track is not in it and nothing is restored.
+  const playlist = await fetchPlaylist(app, playlistId);
+  const ids = playlist.map((it) => queueRenderer(it)?.videoId);
+  // Only where the queue really is this playlist from `start` on — what runs
+  // past its end is autoplay. A song can appear twice in a playlist, so try
+  // each place the window's first track occurs.
+  const start = ids.findIndex(
+    (id, at) =>
+      at > 0 &&
+      id === items[0]?.videoId &&
+      items
+        .slice(0, ids.length - at)
+        .every((it, index) => it?.videoId === ids[at + index]),
+  );
+  // The queue may have moved on while the playlist was being fetched.
+  if (start <= 0 || firstId() !== items[0]?.videoId) return;
+
+  queue.dispatch({
+    type: 'ADD_ITEMS',
+    payload: {
+      nextQueueItemId: store.getState().queue.nextQueueItemId,
+      index: 0,
+      items: playlist.slice(0, start),
+      shuffleEnabled: false,
+      shouldAssignIds: true,
+    },
+  });
+};
 
 async function onApiLoaded() {
   // Workaround for macOS traffic lights
@@ -95,11 +201,13 @@ async function onApiLoaded() {
   window.ipcRenderer.on('peard:seek-to', (_, t: number) => api!.seekTo(t));
   window.ipcRenderer.on('peard:seek-by', (_, t: number) => api!.seekBy(t));
   window.ipcRenderer.on('peard:shuffle', () => {
+    const wasShuffled = isShuffled();
     document
       .querySelector<HTMLElement & { queue: { shuffle: () => void } }>(
         'ytmusic-player-bar',
       )
       ?.queue.shuffle();
+    if (wasShuffled) restorePlaylistHead().catch(console.error);
   });
 
   const isShuffled = () => {
@@ -390,6 +498,77 @@ async function onApiLoaded() {
         result ?? null,
         requestId,
       );
+    },
+  );
+
+  window.ipcRenderer.on(
+    'peard:get-library-playlists',
+    async (_, continuation?: string, requestId?: string) => {
+      // Always reply (null on failure) so the requester never hangs.
+      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+      // FEmusic_liked_playlists is the browse page behind Library > Playlists
+      const result = app
+        ? await app.networkManager
+            .fetch<unknown, { browseId?: string; continuation?: string }>(
+              '/browse',
+              continuation
+                ? { continuation }
+                : { browseId: 'FEmusic_liked_playlists' },
+            )
+            .catch(() => null)
+        : null;
+
+      window.ipcRenderer.send(
+        'peard:library-playlists-response',
+        result ?? null,
+        requestId,
+      );
+    },
+  );
+
+  window.ipcRenderer.on(
+    'peard:play-playlist',
+    async (_, playlistId: string, requestId?: string) => {
+      const reply = (ok: boolean) =>
+        window.ipcRenderer.send('peard:play-playlist-response', ok, requestId);
+
+      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+      const queue = document.querySelector<QueueElement>('#queue');
+      if (!app || !queue) return reply(false);
+
+      // Library browse ids are the playlist id prefixed with "VL"
+      const id = playlistId.startsWith('VL') ? playlistId.slice(2) : playlistId;
+
+      // Navigating to an id YouTube Music cannot play clears the queue and
+      // stops what was playing, so only go once it is known to have tracks.
+      // (A whole-playlist fetch, but `/next` measured no faster.)
+      if ((await fetchPlaylist(app, id)).length === 0) return reply(false);
+
+      // The queue is replaced on arrival, which is how replaying the playlist
+      // already playing is told apart from not having navigated yet.
+      const store = queue.queue.store.store;
+      const before = store.getState().queue.items;
+
+      // Navigate the way YouTube Music's own play buttons do. Swapping the
+      // queue's items instead leaves its context and shuffle endpoints on the
+      // previous playlist, so shuffling would rebuild the queue from that one.
+      app.dispatchEvent(
+        new CustomEvent('yt-navigate', {
+          bubbles: true,
+          composed: true,
+          detail: { endpoint: { watchEndpoint: { playlistId: id } } },
+        }),
+      );
+
+      // Done once the new queue is in and its selected track is from the
+      // playlist.
+      const ok = await waitFor(() => {
+        const { items } = store.getState().queue;
+        if (items === before) return false;
+        const playing = items.map(queueRenderer).find((it) => it?.selected);
+        return playing?.navigationEndpoint?.watchEndpoint?.playlistId === id;
+      }, 8000);
+      reply(ok);
     },
   );
 

@@ -16,7 +16,9 @@ import {
   AddSongToQueueSchema,
   GoBackSchema,
   GoForwardScheme,
+  LibraryPlaylistsQuerySchema,
   MoveSongInQueueSchema,
+  PlaylistParamsSchema,
   QueueParamsSchema,
   SearchSchema,
   SeekSchema,
@@ -623,6 +625,59 @@ const routes = {
       },
     },
   }),
+  libraryPlaylists: createRoute({
+    method: 'get',
+    path: `/api/${API_VERSION}/library/playlists`,
+    summary: 'get library playlists',
+    description:
+      "Get the playlists in the signed-in account's library (raw YouTube Music browse response). Pass the continuation token from a previous response to get the next page.",
+    request: {
+      query: LibraryPlaylistsQuerySchema,
+    },
+    responses: {
+      200: {
+        description: 'Success',
+        content: {
+          'application/json': {
+            schema: z.object({}),
+          },
+        },
+      },
+      204: {
+        description: 'YouTube Music could not fetch the library page',
+      },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
+    },
+  }),
+  playPlaylist: createRoute({
+    method: 'post',
+    path: `/api/${API_VERSION}/library/playlists/{playlistId}/play`,
+    summary: 'play a playlist',
+    description:
+      'Replace the queue with a playlist and start playing it from the first song. Accepts a playlist id or its "VL"-prefixed browse id.',
+    request: {
+      params: PlaylistParamsSchema,
+    },
+    responses: {
+      204: {
+        description: 'Success',
+      },
+      404: {
+        description: 'Playlist could not be loaded or is empty',
+      },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
+    },
+  }),
 };
 
 type PromiseOrValue<T> = T | Promise<T>;
@@ -966,5 +1021,36 @@ export const register = (
 
     ctx.status(200);
     return ctx.json(response as object);
+  });
+
+  // Library
+  app.openapi(routes.libraryPlaylists, async (ctx) => {
+    const { continuation } = ctx.req.valid('query');
+    let response: unknown;
+    try {
+      response = await controller.getLibraryPlaylists(continuation);
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
+
+    if (!response) {
+      ctx.status(204);
+      return ctx.body(null);
+    }
+
+    ctx.status(200);
+    return ctx.json(response as object);
+  });
+  app.openapi(routes.playPlaylist, async (ctx) => {
+    const { playlistId } = ctx.req.valid('param');
+    let ok: boolean;
+    try {
+      ok = await controller.playPlaylist(playlistId);
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
+
+    ctx.status(ok ? 204 : 404);
+    return ctx.body(null);
   });
 };

@@ -42,6 +42,8 @@ const parseStringFromArgsType = (args: ArgsType<string>) => {
 export const RENDERER_REQUEST_TIMEOUT_MS = 3000;
 /** Search goes over the network from the renderer, so it gets more time. */
 export const RENDERER_SEARCH_TIMEOUT_MS = 10000;
+/** Starting a playlist: a check, a navigation, then waiting for it to land. */
+export const RENDERER_PLAY_TIMEOUT_MS = 12000;
 
 /** One queue slot in the lightweight queue representation. */
 export interface SlimQueueItem {
@@ -282,6 +284,33 @@ export const getSongControls = (win: BrowserWindow) => {
         'peard:search-results',
         [query, params, continuation],
         RENDERER_SEARCH_TIMEOUT_MS,
+      ),
+
+    // Library
+    /**
+     * Resolves with the raw Library > Playlists browse response, or `null` if
+     * the renderer could not fetch it. Rejects with a
+     * {@link RendererRequestError} on timeout.
+     */
+    getLibraryPlaylists: (continuation?: string) =>
+      requestFromRenderer<unknown>(
+        win,
+        'peard:get-library-playlists',
+        'peard:library-playlists-response',
+        [continuation],
+        RENDERER_SEARCH_TIMEOUT_MS,
+      ),
+    /**
+     * Resolves true once the playlist is playing, false if it cannot be
+     * played. Rejects with a {@link RendererRequestError} on timeout.
+     */
+    playPlaylist: (playlistId: string) =>
+      requestFromRenderer<boolean>(
+        win,
+        'peard:play-playlist',
+        'peard:play-playlist-response',
+        [playlistId],
+        RENDERER_PLAY_TIMEOUT_MS,
       ),
   };
 };
