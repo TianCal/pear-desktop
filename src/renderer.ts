@@ -527,6 +527,26 @@ async function onApiLoaded() {
   );
 
   window.ipcRenderer.on(
+    'peard:browse',
+    async (_, browseId: string, requestId?: string) => {
+      // Always reply (null on failure) so the requester never hangs. Only
+      // fetches the page; the window does not navigate.
+      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+      const result = app
+        ? await app.networkManager
+            .fetch<unknown, { browseId: string }>('/browse', { browseId })
+            .catch(() => null)
+        : null;
+
+      window.ipcRenderer.send(
+        'peard:browse-response',
+        result ?? null,
+        requestId,
+      );
+    },
+  );
+
+  window.ipcRenderer.on(
     'peard:play-playlist',
     async (_, playlistId: string, requestId?: string) => {
       const reply = (ok: boolean) =>

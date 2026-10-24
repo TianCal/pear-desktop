@@ -301,6 +301,19 @@ export const getSongControls = (win: BrowserWindow) => {
         RENDERER_SEARCH_TIMEOUT_MS,
       ),
     /**
+     * Resolves with the raw browse response for a page such as an artist's
+     * (`UC…`), or `null` if the renderer could not fetch it. Rejects with a
+     * {@link RendererRequestError} on timeout.
+     */
+    browse: (browseId: string) =>
+      requestFromRenderer<unknown>(
+        win,
+        'peard:browse',
+        'peard:browse-response',
+        [browseId],
+        RENDERER_SEARCH_TIMEOUT_MS,
+      ),
+    /**
      * Resolves true once the playlist is playing, false if it cannot be
      * played. Rejects with a {@link RendererRequestError} on timeout.
      */

@@ -14,6 +14,7 @@ import {
 import { API_VERSION } from '../api-version';
 import {
   AddSongToQueueSchema,
+  BrowseParamsSchema,
   GoBackSchema,
   GoForwardScheme,
   LibraryPlaylistsQuerySchema,
@@ -654,6 +655,38 @@ const routes = {
       },
     },
   }),
+  browse: createRoute({
+    method: 'get',
+    path: `/api/${API_VERSION}/browse/{browseId}`,
+    summary: 'get a browse page',
+    description:
+      "Get a YouTube Music page such as an artist's (raw YouTube Music browse response) without navigating the window. Artist pages take the artist's channel id.",
+    request: {
+      params: BrowseParamsSchema,
+    },
+    responses: {
+      200: {
+        description: 'Success',
+        content: {
+          'application/json': {
+            schema: z.object({}),
+          },
+        },
+      },
+      204: {
+        description: 'YouTube Music could not fetch the page',
+      },
+      400: {
+        description: 'Not a browse id',
+      },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
+    },
+  }),
   playPlaylist: createRoute({
     method: 'post',
     path: `/api/${API_VERSION}/library/playlists/{playlistId}/play`,
@@ -1029,6 +1062,23 @@ export const register = (
     let response: unknown;
     try {
       response = await controller.getLibraryPlaylists(continuation);
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
+
+    if (!response) {
+      ctx.status(204);
+      return ctx.body(null);
+    }
+
+    ctx.status(200);
+    return ctx.json(response as object);
+  });
+  app.openapi(routes.browse, async (ctx) => {
+    const { browseId } = ctx.req.valid('param');
+    let response: unknown;
+    try {
+      response = await controller.browse(browseId);
     } catch (err) {
       return rendererError(ctx, err);
     }
