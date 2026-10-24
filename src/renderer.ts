@@ -577,6 +577,30 @@ async function onApiLoaded() {
   const audioSource = audioContext.createMediaElementSource(video);
   audioSource.connect(audioContext.destination);
 
+  // A running AudioContext renders silence nonstop, which kept a paused,
+  // hidden window at ~2% CPU and ~120 wakeups/s. Suspend it once playback
+  // has stayed paused for a while (quick toggles and track changes never
+  // touch it) and resume on 'play', which fires before playback starts.
+  // Always resume: a suspend still in flight reports 'running'.
+  const AUDIO_IDLE_MS = 15_000;
+  let audioIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  const wakeAudio = () => {
+    clearTimeout(audioIdleTimer);
+    audioIdleTimer = undefined;
+    audioContext.resume().catch(console.error);
+  };
+  const idleAudio = () => {
+    clearTimeout(audioIdleTimer);
+    audioIdleTimer = setTimeout(() => {
+      audioIdleTimer = undefined;
+      if (video.paused) audioContext.suspend().catch(console.error);
+    }, AUDIO_IDLE_MS);
+  };
+  video.addEventListener('play', wakeAudio, { passive: true });
+  video.addEventListener('pause', idleAudio, { passive: true });
+  video.addEventListener('ended', idleAudio, { passive: true });
+  if (video.paused) idleAudio();
+
   for (const [id, plugin] of Object.entries(getAllLoadedRendererPlugins())) {
     if (typeof plugin.renderer !== 'function') {
       await plugin.renderer?.onPlayerApiReady?.call(
