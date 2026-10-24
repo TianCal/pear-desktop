@@ -16,8 +16,16 @@ export interface BackendContext<
 > extends BaseContext<Config> {
   ipc: {
     send: WebContents['send'];
-    handle: (event: string, listener: CallableFunction) => void;
-    on: (event: string, listener: CallableFunction) => void;
+    /**
+     * Registers an `ipcMain.handle` handler. It is removed automatically when
+     * the plugin is unloaded. Returns a disposer that removes it early.
+     */
+    handle: (event: string, listener: CallableFunction) => () => void;
+    /**
+     * Registers an `ipcMain.on` listener. It is removed automatically when
+     * the plugin is unloaded. Returns a disposer that removes it early.
+     */
+    on: (event: string, listener: CallableFunction) => () => void;
     removeHandler: IpcMain['removeHandler'];
   };
 
@@ -43,7 +51,11 @@ export interface RendererContext<
   ipc: {
     send: IpcRenderer['send'];
     invoke: IpcRenderer['invoke'];
-    on: (event: string, listener: CallableFunction) => void;
+    /**
+     * Registers an IPC listener. It stops firing automatically when the
+     * plugin is unloaded. Returns a disposer that stops it early.
+     */
+    on: (event: string, listener: CallableFunction) => () => void;
     removeAllListeners: (event: string) => void;
   };
 }

@@ -1,4 +1,5 @@
 import prompt from 'custom-electron-prompt';
+import { deepmerge } from 'deepmerge-ts';
 import {
   app,
   type BrowserWindow,
@@ -35,12 +36,13 @@ const pluginEnabledMenu = async (
   isNew = false,
   hasSubmenu = false,
   refreshMenu?: (() => void) ,
+  checked?: boolean,
 ): Promise<Electron.MenuItemConstructorOptions> => ({
   label: label || plugin,
   sublabel: isNew ? t('main.menu.plugins.new') : undefined,
   toolTip: description,
   type: 'checkbox',
-  checked: await config.plugins.isEnabled(plugin),
+  checked: checked ?? (await config.plugins.isEnabled(plugin)),
   click(item: Electron.MenuItem) {
     if (item.checked) {
       config.plugins.enable(plugin);
@@ -70,6 +72,14 @@ export const mainMenuTemplate = async (
 
   const allPluginsStubs = await allPlugins();
 
+  // Read the plugin configs once instead of once (or twice) per plugin
+  const pluginConfigs = config.plugins.getPlugins() ?? {};
+  const isPluginEnabled = (id: string) =>
+    deepmerge(
+      allPluginsStubs[id]?.config ?? { enabled: false },
+      pluginConfigs[id] ?? {},
+    ).enabled;
+
   const menuResult = await Promise.all(
     Object.entries(getAllMenuTemplate()).map(async ([id, template]) => {
       const plugin = allPluginsStubs[id];
@@ -79,7 +89,8 @@ export const mainMenuTemplate = async (
         ? satisfies(packageJson.version, plugin.addedVersion)
         : false;
 
-      if (!(await config.plugins.isEnabled(id))) {
+      const enabled = isPluginEnabled(id);
+      if (!enabled) {
         return [
           id,
           await pluginEnabledMenu(
@@ -89,6 +100,7 @@ export const mainMenuTemplate = async (
             isNew,
             true,
             innerRefreshMenu,
+            enabled,
           ),
         ] as const;
       }
@@ -107,6 +119,7 @@ export const mainMenuTemplate = async (
               false,
               true,
               innerRefreshMenu,
+              enabled,
             ),
             { type: 'separator' },
             ...template,
@@ -116,7 +129,7 @@ export const mainMenuTemplate = async (
     }),
   );
 
-  const availablePlugins = Object.keys(await allPlugins());
+  const availablePlugins = Object.keys(allPluginsStubs);
   const pluginMenus = await Promise.all(
     availablePlugins
       .sort((a, b) => {
@@ -143,6 +156,7 @@ export const mainMenuTemplate = async (
           isNew,
           true,
           innerRefreshMenu,
+          isPluginEnabled(id),
         );
       }),
   );

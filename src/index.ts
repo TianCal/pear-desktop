@@ -27,7 +27,7 @@ import electronUpdater from 'electron-updater';
 import { deepEqual } from 'fast-equals';
 import { parse } from 'node-html-parser';
 import { languageResources } from 'virtual:i18n';
-import { allPlugins, mainPlugins } from 'virtual:plugins';
+import { allPlugins, mainPluginNames } from 'virtual:plugins';
 
 import * as config from '@/config';
 import { APPLICATION_NAME, loadI18n, setLanguage, t } from '@/i18n';
@@ -37,7 +37,7 @@ import {
   getAllLoadedMainPlugins,
   loadAllMainPlugins,
 } from '@/loader/main';
-import { refreshMenu, setApplicationMenu } from '@/menu';
+import { refreshMenu } from '@/menu';
 import musicPlayerCss from '@/music-player.css?inline';
 import { defaultAuthProxyConfig } from '@/plugins/auth-proxy-adapter/config';
 import { fileExists, injectCSS, injectCSSAsFile } from '@/plugins/utils/main';
@@ -187,9 +187,7 @@ function onClosed() {
   mainWindow = null;
 }
 
-ipcMain.handle('peard:get-main-plugin-names', async () =>
-  Object.keys(await mainPlugins()),
-);
+ipcMain.handle('peard:get-main-plugin-names', () => mainPluginNames());
 
 const initHook = async (win: BrowserWindow) => {
   const allPluginStubs = await allPlugins();
@@ -215,6 +213,9 @@ const initHook = async (win: BrowserWindow) => {
       string,
       unknown
     >;
+
+    // Most changes (e.g. the current `url`) don't touch plugin configs
+    if (deepEqual(oldPluginConfigList, newPluginConfigList)) return;
 
     Object.entries(newPluginConfigList).forEach(([id, newPluginConfig]) => {
       const isEqual = deepEqual(oldPluginConfigList[id], newPluginConfig);
@@ -717,12 +718,15 @@ app.whenReady().then(async () => {
     }
   }
 
-  ipcMain.on('get-renderer-script', (event) => {
+  // The renderer bundle does not change while the app is running, so read and
+  // parse it only once instead of on every page load
+  let rendererScriptCache: [string | null, string] | undefined;
+  const getRendererScript = (): [string | null, string] => {
     // Inject index.html file as string using insertAdjacentHTML
     // In dev mode, get string from process.env.VITE_DEV_SERVER_URL, else use fs.readFileSync
     if (is.dev() && process.env.ELECTRON_RENDERER_URL) {
       // HACK: to make vite work with electron renderer (supports hot reload)
-      event.returnValue = [
+      return [
         null,
         `
         console.log('${LoggerPrefix}', 'Loading vite from dev server');
@@ -758,15 +762,21 @@ app.whenReady().then(async () => {
         scriptSrc.getAttribute('src')!,
       );
       const scriptString = fs.readFileSync(scriptPath, 'utf-8');
-      event.returnValue = [
+      return [
         url.pathToFileURL(scriptPath).toString(),
         scriptString + ';0',
       ];
     }
+  };
+
+  ipcMain.on('get-renderer-script', (event) => {
+    rendererScriptCache ??= getRendererScript();
+    event.returnValue = rendererScriptCache;
   });
 
   mainWindow = await createMainWindow();
-  await setApplicationMenu(mainWindow);
+  // refreshMenu builds and sets the application menu (and notifies the
+  // in-app-menu), so building it again with setApplicationMenu is redundant
   await refreshMenu(mainWindow);
   setUpTray(app, mainWindow);
 

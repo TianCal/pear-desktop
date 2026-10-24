@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { globSync } from 'glob';
 import { Project } from 'ts-morph';
 
+import { PLUGIN_STUB_QUERY } from './plugin-loader.mjs';
+
 // HACK: DO NOT USE @ ALIAS IN THIS FILE, IT WILL CAUSE PROBLEMS
 import { Platform } from '../src/types/plugins';
 
@@ -50,14 +52,23 @@ export const pluginVirtualModuleGenerator = (
         const absolutePath = resolve(srcPath, '..', path).replace(/\\/g, '/');
         if (mode === 'main') {
           // dynamic import (for main)
+          // The full module (with backend & menu) is only imported on demand,
+          // e.g. for enabled plugins. The stub module (metadata & config only,
+          // see plugin-loader) is what `allPlugins()` imports eagerly.
           writer.writeLine(
             `const ${kebabToCamel(name)}PluginImport = () => import('${absolutePath}');`,
+          );
+          writer.writeLine(
+            `const ${kebabToCamel(name)}PluginStubImport = () => import('${absolutePath}?${PLUGIN_STUB_QUERY}');`,
           );
           writer.writeLine(
             `const ${kebabToCamel(name)}Plugin = async () => (await ${kebabToCamel(name)}PluginImport()).default;`,
           );
           writer.writeLine(
-            `const ${kebabToCamel(name)}PluginStub = async () => (await ${kebabToCamel(name)}PluginImport()).pluginStub;`,
+            `const ${kebabToCamel(name)}PluginStub = async () => (await ${kebabToCamel(name)}PluginStubImport()).pluginStub;`,
+          );
+          writer.writeLine(
+            `const ${kebabToCamel(name)}PluginHasBackend = async () => (await ${kebabToCamel(name)}PluginStubImport()).pluginHasBackend !== false;`,
           );
         } else {
           // static import (preload does not support dynamic import)
@@ -128,6 +139,50 @@ export const pluginVirtualModuleGenerator = (
       writer.writeLine('  return await promise;');
       writer.writeLine('};');
       writer.blankLine();
+
+      if (mode === 'main') {
+        // Lazy, per-plugin access to the full plugin (backend & menu), so only
+        // the plugins that are actually used get their backend imported
+        writer.writeLine('const fullPluginLoaders = {');
+        for (const { name } of plugins) {
+          writer.writeLine(`  "${name}": ${kebabToCamel(name)}Plugin,`);
+        }
+        writer.writeLine('};');
+        writer.writeLine('const backendFlagLoaders = {');
+        for (const { name } of plugins) {
+          writer.writeLine(`  "${name}": ${kebabToCamel(name)}PluginHasBackend,`);
+        }
+        writer.writeLine('};');
+        writer.blankLine();
+
+        writer.writeLine('export const fullPlugin = async (id) => {');
+        writer.writeLine('  if (!Object.hasOwn(fullPluginLoaders, id)) return undefined;');
+        writer.writeLine('  const plg = await fullPluginLoaders[id]();');
+        writer.writeLine('  return plg && supportsPlatform(plg) ? plg : undefined;');
+        writer.writeLine('};');
+        writer.blankLine();
+
+        writer.writeLine('export const mainPlugin = async (id) => {');
+        writer.writeLine('  if (!Object.hasOwn(backendFlagLoaders, id)) return undefined;');
+        writer.writeLine('  if (!(await backendFlagLoaders[id]())) return undefined;');
+        writer.writeLine('  const plg = await fullPlugin(id);');
+        writer.writeLine("  return plg && plg['backend'] ? plg : undefined;");
+        writer.writeLine('};');
+        writer.blankLine();
+
+        writer.writeLine('export const mainPluginNames = async () => {');
+        writer.writeLine('  const stubs = await allPlugins();');
+        writer.writeLine('  const flags = await Promise.all(');
+        writer.writeLine(
+          '    Object.keys(stubs).map(async (id) => [id, await backendFlagLoaders[id]()]),',
+        );
+        writer.writeLine('  );');
+        writer.writeLine(
+          '  return flags.filter(([, hasBackend]) => hasBackend).map(([id]) => id);',
+        );
+        writer.writeLine('};');
+        writer.blankLine();
+      }
     },
     { overwrite: true },
   );

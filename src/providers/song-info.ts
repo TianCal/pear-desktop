@@ -45,9 +45,10 @@ export interface SongInfo {
   tags?: string[];
 }
 
-// Grab the native image using the src
-export const getImage = async (src: string): Promise<Electron.NativeImage> => {
-  const result = await net.fetch(src);
+const imageFromResponse = async (
+  src: string,
+  result: Response,
+): Promise<Electron.NativeImage> => {
   const output = nativeImage.createFromBuffer(
     Buffer.from(await result.arrayBuffer()),
   );
@@ -57,6 +58,60 @@ export const getImage = async (src: string): Promise<Electron.NativeImage> => {
   }
 
   return output;
+};
+
+// Grab the native image using the src
+export const getImage = async (src: string): Promise<Electron.NativeImage> =>
+  imageFromResponse(src, await net.fetch(src));
+
+// Small LRU of recently fetched covers, keyed by the full-size URL. Replaying a
+// song (or the same album art) then costs no network round trip.
+const COVER_CACHE_SIZE = 10;
+const coverCache = new Map<
+  string,
+  { src: string; image: Electron.NativeImage }
+>();
+
+/**
+ * Fetch the cover, trying the full-size URL first and falling back to the
+ * original (lower resolution) one only if that request fails.
+ */
+const fetchCover = async (
+  fullSrc: string,
+  fallbackSrc: string | undefined,
+): Promise<{ src: string; image: Electron.NativeImage }> => {
+  const cached = coverCache.get(fullSrc);
+  if (cached) {
+    coverCache.delete(fullSrc);
+    coverCache.set(fullSrc, cached);
+    return cached;
+  }
+
+  let cover: { src: string; image: Electron.NativeImage } | undefined;
+  try {
+    const result = await net.fetch(fullSrc);
+    if (result.ok) {
+      cover = { src: fullSrc, image: await imageFromResponse(fullSrc, result) };
+    }
+  } catch {
+    // fall through to the fallback URL
+  }
+
+  if (!cover) {
+    const src = fallbackSrc ?? fullSrc;
+    cover = { src, image: await getImage(src) };
+  }
+
+  if (!cover.image.isEmpty()) {
+    coverCache.set(fullSrc, cover);
+    while (coverCache.size > COVER_CACHE_SIZE) {
+      const oldest = coverCache.keys().next().value;
+      if (oldest === undefined) break;
+      coverCache.delete(oldest);
+    }
+  }
+
+  return cover;
 };
 
 const handleData = async (
@@ -154,14 +209,11 @@ const handleData = async (
     const thumbnails = videoDetails.thumbnail?.thumbnails;
     songInfo.imageSrc = thumbnails?.at(-1)?.url?.split('?')?.at(0);
 
-    if (
-      songInfo.imageSrc &&
-      !(await net.fetch(songInfo.imageSrc, { method: 'HEAD' })).ok
-    ) {
-      songInfo.imageSrc = thumbnails.at(-1)?.url;
+    if (songInfo.imageSrc) {
+      const cover = await fetchCover(songInfo.imageSrc, thumbnails.at(-1)?.url);
+      songInfo.imageSrc = cover.src;
+      songInfo.image = cover.image;
     }
-
-    if (songInfo.imageSrc) songInfo.image = await getImage(songInfo.imageSrc);
 
     win.webContents.send('peard:update-song-info', songInfo);
   }
@@ -185,6 +237,9 @@ const callbacks: Set<SongInfoCallback> = new Set();
 // This function will allow plugins to register callback that will be triggered when data changes
 export const registerCallback = (callback: SongInfoCallback) => {
   callbacks.add(callback);
+  return () => {
+    callbacks.delete(callback);
+  };
 };
 
 const registerProvider = (win: BrowserWindow) => {

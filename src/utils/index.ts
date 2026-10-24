@@ -70,6 +70,10 @@ type Options<Config extends PluginConfig> =
   | { ctx: 'preload'; context: PreloadContext<Config> }
   | { ctx: 'renderer'; context: RendererContext<Config> };
 
+// Functions created by `startPlugin`'s bind hack, so that starting a plugin
+// again (e.g. re-enabling it) doesn't wrap its methods in yet another bind
+const boundLifecycleFunctions = new WeakSet<CallableFunction>();
+
 export const startPlugin = async <Config extends PluginConfig>(
   id: string,
   def: PluginDef<unknown, unknown, unknown, Config>,
@@ -91,9 +95,15 @@ export const startPlugin = async <Config extends PluginConfig>(
     const defContext = def[options.ctx];
     if (defContext && typeof defContext !== 'function') {
       Object.entries(defContext).forEach(([key, value]) => {
-        if (typeof value === 'function') {
+        if (
+          typeof value === 'function' &&
+          !boundLifecycleFunctions.has(value as CallableFunction)
+        ) {
           // oxlint-disable-next-line typescript/no-unsafe-assignment,typescript/no-unsafe-call,typescript/no-unsafe-member-access
-          defContext[key as keyof typeof defContext] = value.bind(defContext);
+          const bound = value.bind(defContext) as CallableFunction;
+          boundLifecycleFunctions.add(bound);
+          // oxlint-disable-next-line typescript/no-unsafe-assignment
+          defContext[key as keyof typeof defContext] = bound as never;
         }
       });
     }

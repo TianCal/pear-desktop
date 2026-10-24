@@ -9,6 +9,7 @@ import {
   type ObjectLiteralExpression,
   type Node,
   type ObjectLiteralElementLike,
+  type SourceFile,
 } from 'ts-morph';
 
 import type { PluginOption } from 'vite';
@@ -21,6 +22,54 @@ const globalProject = new Project({
   skipLoadingLibFiles: true,
   skipFileDependencyResolution: true,
 });
+
+/**
+ * Query appended (by plugin-importer) to a plugin's index module to get its
+ * "stub" variant in the main process: metadata and config only, without the
+ * backend/menu (and without the imports only they used), so importing every
+ * plugin's stub at startup doesn't pull in every plugin's backend code.
+ */
+export const PLUGIN_STUB_QUERY = 'plugin-stub';
+
+// Removes import declarations whose bindings are no longer referenced
+// (side-effect-only imports are kept). Over-approximates "used" by name.
+const removeUnusedImports = (src: SourceFile) => {
+  const usedNames = new Set<string>();
+  src.forEachDescendant((node) => {
+    if (node.getKind() !== ts.SyntaxKind.Identifier) return;
+    if (node.getFirstAncestorByKind(ts.SyntaxKind.ImportDeclaration)) return;
+    usedNames.add(node.getText());
+  });
+
+  for (const decl of src.getImportDeclarations()) {
+    const defaultImport = decl.getDefaultImport();
+    const namespaceImport = decl.getNamespaceImport();
+    const namedImports = decl.getNamedImports();
+    if (!defaultImport && !namespaceImport && namedImports.length === 0) {
+      // `import 'x'` (side effects only) or `import {} from 'x'`
+      if (!decl.getImportClause()) continue;
+    }
+
+    for (const named of namedImports) {
+      const localName = (named.getAliasNode() ?? named.getNameNode()).getText();
+      if (!usedNames.has(localName)) named.remove();
+    }
+    if (defaultImport && !usedNames.has(defaultImport.getText())) {
+      decl.removeDefaultImport();
+    }
+    if (namespaceImport && !usedNames.has(namespaceImport.getText())) {
+      decl.removeNamespaceImport();
+    }
+
+    if (
+      !decl.getDefaultImport() &&
+      !decl.getNamespaceImport() &&
+      decl.getNamedImports().length === 0
+    ) {
+      decl.remove();
+    }
+  }
+};
 
 // Helper to extract a property’s name from its node
 const getPropertyName = (prop: Node): string | null => {
@@ -42,9 +91,13 @@ export default function (
     name: 'ytm-plugin-loader',
     load: {
       filter: {
-        id: /(?:\/plugins\/[^/]+\/index\.(?:js|ts|jsx|tsx)|\/plugins\/[^/]+\.(?:js|ts|jsx|tsx))$/,
+        id: new RegExp(
+          String.raw`(?:\/plugins\/[^/]+\/index\.(?:js|ts|jsx|tsx)|\/plugins\/[^/]+\.(?:js|ts|jsx|tsx))(?:\?${PLUGIN_STUB_QUERY})?$`,
+        ),
       },
-      handler(id) {
+      handler(rawId) {
+        const [id, query] = rawId.split('?');
+        const isStub = mode === 'backend' && query === PLUGIN_STUB_QUERY;
         const fileContent = readFileSync(id, 'utf8');
         // Create or update source file in the global project instance
         const src = globalProject.createSourceFile(
@@ -121,13 +174,19 @@ export default function (
           if (name) propMap.set(name, prop);
         }
 
+        const hasBackend = propMap.has('backend');
         const contexts = ['backend', 'preload', 'renderer', 'menu'];
         for (const ctx of contexts) {
           if (mode === 'none' && propMap.has(ctx)) {
             propMap.get(ctx)?.remove();
             continue;
           }
-          if (ctx === mode || (ctx === 'menu' && mode === 'backend')) continue;
+          if (
+            !isStub &&
+            (ctx === mode || (ctx === 'menu' && mode === 'backend'))
+          ) {
+            continue;
+          }
           if (propMap.has(ctx)) propMap.get(ctx)?.remove();
         }
 
@@ -154,7 +213,7 @@ export default function (
         }
 
         const stubContexts =
-          mode === 'backend'
+          mode === 'backend' && !isStub
             ? contexts.filter((ctx) => ctx !== 'menu')
             : contexts;
         for (const ctx of stubContexts) {
@@ -162,6 +221,21 @@ export default function (
             stubMap.get(ctx)?.remove();
           }
         }
+
+        if (mode === 'backend') {
+          src.addVariableStatement({
+            isExported: true,
+            declarationKind: VariableDeclarationKind.Const,
+            declarations: [
+              {
+                name: 'pluginHasBackend',
+                initializer: String(hasBackend),
+              },
+            ],
+          });
+        }
+
+        if (isStub) removeUnusedImports(src);
 
         return {
           code: src.getText(),

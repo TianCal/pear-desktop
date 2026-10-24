@@ -1,7 +1,10 @@
 import { createRoute, z } from '@hono/zod-openapi';
-import { ipcMain } from 'electron';
 
-import { getSongControls } from '@/providers/song-controls';
+import {
+  getSongControls,
+  RendererRequestError,
+  type SlimQueueResponse,
+} from '@/providers/song-controls';
 import {
   LikeType,
   type RepeatMode,
@@ -209,6 +212,12 @@ const routes = {
           },
         },
       },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
     },
   }),
   shuffle: createRoute({
@@ -350,6 +359,12 @@ const routes = {
           },
         },
       },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
     },
   }),
   oldQueueInfo: createRoute({
@@ -369,6 +384,12 @@ const routes = {
       },
       204: {
         description: 'No queue info',
+      },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
       },
     },
   }),
@@ -429,13 +450,28 @@ const routes = {
       204: {
         description: 'No next song in queue',
       },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
     },
   }),
   queueInfo: createRoute({
     method: 'get',
     path: `/api/${API_VERSION}/queue`,
     summary: 'get current queue info',
-    description: 'Get the current queue info',
+    description:
+      'Get the current queue info. Pass `?slim=true` for a lightweight list of `{ index, videoId, title, artist, thumbnail, duration, selected }` items instead of the raw player renderers.',
+    request: {
+      query: z.object({
+        slim: z.string().optional().openapi({
+          description:
+            '`true` or `1` returns a lightweight queue (`{ items, total, selectedIndex, autoPlaying }`).',
+        }),
+      }),
+    },
     responses: {
       200: {
         description: 'Success',
@@ -447,6 +483,12 @@ const routes = {
       },
       204: {
         description: 'No queue info',
+      },
+      503: {
+        description: 'Player window is not available',
+      },
+      504: {
+        description: 'Player did not respond in time',
       },
     },
   }),
@@ -563,11 +605,53 @@ const routes = {
           },
         },
       },
+      503: {
+        description: 'Player window is not available or search failed',
+        content: {
+          'application/json': {
+            schema: z.object({ error: z.string() }),
+          },
+        },
+      },
+      504: {
+        description: 'Player did not respond in time',
+        content: {
+          'application/json': {
+            schema: z.object({ error: z.string() }),
+          },
+        },
+      },
     },
   }),
 };
 
 type PromiseOrValue<T> = T | Promise<T>;
+
+/** Map a failed renderer request to 503 (unavailable) / 504 (timeout). */
+const rendererError = (ctx: Context, err: unknown) => {
+  if (err instanceof RendererRequestError) {
+    ctx.status(err.reason === 'timeout' ? 504 : 503);
+    return ctx.body(null);
+  }
+  throw err;
+};
+
+/**
+ * Share one in-flight promise between concurrent callers. `reset` makes the
+ * next caller start a fresh request, for use after the data has changed.
+ */
+const coalesce = <T>(fn: () => Promise<T>) => {
+  let inflight: Promise<T> | undefined;
+  const get = () =>
+    (inflight ??= fn().finally(() => {
+      inflight = undefined;
+    }));
+  return Object.assign(get, {
+    reset: () => {
+      inflight = undefined;
+    },
+  });
+};
 
 export const register = (
   app: HonoApp,
@@ -648,18 +732,12 @@ export const register = (
   });
 
   app.openapi(routes.getShuffleState, async (ctx) => {
-    const stateResponsePromise = new Promise<boolean>((resolve) => {
-      ipcMain.once(
-        'peard:get-shuffle-response',
-        (_, isShuffled: boolean | undefined) => {
-          return resolve(!!isShuffled);
-        },
-      );
-
-      controller.requestShuffleInformation();
-    });
-
-    const isShuffled = await stateResponsePromise;
+    let isShuffled: boolean;
+    try {
+      isShuffled = !!(await controller.getShuffleState());
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
 
     ctx.status(200);
     return ctx.json({ state: isShuffled });
@@ -711,18 +789,12 @@ export const register = (
   });
 
   app.openapi(routes.getFullscreenState, async (ctx) => {
-    const stateResponsePromise = new Promise<boolean>((resolve) => {
-      ipcMain.once(
-        'peard:set-fullscreen',
-        (_, isFullscreen: boolean | undefined) => {
-          return resolve(!!isFullscreen);
-        },
-      );
-
-      controller.requestFullscreenInformation();
-    });
-
-    const fullscreen = await stateResponsePromise;
+    let fullscreen: boolean;
+    try {
+      fullscreen = !!(await controller.getFullscreenState());
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
 
     ctx.status(200);
     return ctx.json({ state: fullscreen });
@@ -746,16 +818,27 @@ export const register = (
   app.openapi(routes.songInfo, songInfo);
 
   // Queue
+  // Concurrent queue requests share one renderer round trip.
+  const getQueue = coalesce(() => controller.getQueue());
+  const getSlimQueue = coalesce(() => controller.getSlimQueue());
+  // A request already in flight was sent before a write, so it would return
+  // the queue as it was; later readers must not join it.
+  const invalidateQueue = () => {
+    getQueue.reset();
+    getSlimQueue.reset();
+  };
+
   const queueInfo = async (ctx: Context) => {
-    const queueResponsePromise = new Promise<QueueResponse>((resolve) => {
-      ipcMain.once('peard:get-queue-response', (_, queue: QueueResponse) => {
-        return resolve(queue);
-      });
-
-      controller.requestQueueInformation();
-    });
-
-    const info = await queueResponsePromise;
+    const slim = ctx.req.query('slim');
+    let info: QueueResponse | SlimQueueResponse | undefined;
+    try {
+      info =
+        slim === 'true' || slim === '1'
+          ? await getSlimQueue()
+          : await getQueue();
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
 
     if (!info) {
       ctx.status(204);
@@ -769,15 +852,12 @@ export const register = (
   app.openapi(routes.queueInfo, queueInfo);
 
   app.openapi(routes.nextSongInfo, async (ctx) => {
-    const queueResponsePromise = new Promise<QueueResponse>((resolve) => {
-      ipcMain.once('peard:get-queue-response', (_, queue: QueueResponse) => {
-        return resolve(queue);
-      });
-
-      controller.requestQueueInformation();
-    });
-
-    const queue = await queueResponsePromise;
+    let queue: QueueResponse | undefined;
+    try {
+      queue = await getQueue();
+    } catch (err) {
+      return rendererError(ctx, err);
+    }
 
     if (!queue?.items || queue.items.length === 0) {
       ctx.status(204);
@@ -828,6 +908,7 @@ export const register = (
   app.openapi(routes.addSongToQueue, (ctx) => {
     const { videoId, insertPosition } = ctx.req.valid('json');
     controller.addSongToQueue(videoId, insertPosition);
+    invalidateQueue();
 
     ctx.status(204);
     return ctx.body(null);
@@ -836,6 +917,7 @@ export const register = (
     const index = Number(ctx.req.param('index'));
     const { toIndex } = ctx.req.valid('json');
     controller.moveSongInQueue(index, toIndex);
+    invalidateQueue();
 
     ctx.status(204);
     return ctx.body(null);
@@ -843,6 +925,7 @@ export const register = (
   app.openapi(routes.removeSongFromQueue, (ctx) => {
     const index = Number(ctx.req.param('index'));
     controller.removeSongFromQueue(index);
+    invalidateQueue();
 
     ctx.status(204);
     return ctx.body(null);
@@ -850,19 +933,36 @@ export const register = (
   app.openapi(routes.setQueueIndex, (ctx) => {
     const { index } = ctx.req.valid('json');
     controller.setQueueIndex(index);
+    invalidateQueue();
 
     ctx.status(204);
     return ctx.body(null);
   });
   app.openapi(routes.clearQueue, (ctx) => {
     controller.clearQueue();
+    invalidateQueue();
 
     ctx.status(204);
     return ctx.body(null);
   });
   app.openapi(routes.search, async (ctx) => {
     const { query, params, continuation } = ctx.req.valid('json');
-    const response = await controller.search(query, params, continuation);
+    let response: unknown;
+    try {
+      response = await controller.search(query, params, continuation);
+    } catch (err) {
+      if (err instanceof RendererRequestError) {
+        return err.reason === 'timeout'
+          ? ctx.json({ error: err.message }, 504)
+          : ctx.json({ error: err.message }, 503);
+      }
+      throw err;
+    }
+
+    if (response === null || response === undefined) {
+      // The renderer could not run the search (player not ready / fetch failed)
+      return ctx.json({ error: 'Search failed' }, 503);
+    }
 
     ctx.status(200);
     return ctx.json(response as object);

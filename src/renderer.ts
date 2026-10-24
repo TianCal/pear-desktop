@@ -20,6 +20,10 @@ import {
 import { startingPages } from './providers/extracted-data';
 import { setupSongInfo } from './providers/song-info-front';
 
+import type {
+  SlimQueueItem,
+  SlimQueueResponse,
+} from '@/providers/song-controls';
 import type { MusicPlayer } from '@/types/music-player';
 import type { MusicPlayerAppElement } from '@/types/music-player-app-element';
 import type { QueueResponse } from '@/types/music-player-desktop-internal';
@@ -107,8 +111,14 @@ async function onApiLoaded() {
     return isShuffled !== null;
   };
 
-  window.ipcRenderer.on('peard:get-shuffle', () => {
-    window.ipcRenderer.send('peard:get-shuffle-response', isShuffled());
+  // Request handlers below take an optional request id as their last argument
+  // and echo it back so the main process can match the reply to its request.
+  window.ipcRenderer.on('peard:get-shuffle', (_, requestId?: string) => {
+    window.ipcRenderer.send(
+      'peard:get-shuffle-response',
+      isShuffled(),
+      requestId,
+    );
   });
 
   window.ipcRenderer.on(
@@ -160,8 +170,8 @@ async function onApiLoaded() {
     }
   };
 
-  window.ipcRenderer.on('peard:get-fullscreen', () => {
-    window.ipcRenderer.send('peard:set-fullscreen', isFullscreen());
+  window.ipcRenderer.on('peard:get-fullscreen', (_, requestId?: string) => {
+    window.ipcRenderer.send('peard:set-fullscreen', isFullscreen(), requestId);
   });
 
   window.ipcRenderer.on(
@@ -179,13 +189,69 @@ async function onApiLoaded() {
       ?.onVolumeClick();
   });
 
-  window.ipcRenderer.on('peard:get-queue', () => {
+  window.ipcRenderer.on('peard:get-queue', (_, requestId?: string) => {
     const queue = document.querySelector<QueueElement>('#queue');
-    window.ipcRenderer.send('peard:get-queue-response', {
-      items: queue?.queue.getItems(),
-      autoPlaying: queue?.queue.autoPlaying,
-      continuation: queue?.queue.continuation,
-    } satisfies QueueResponse);
+    window.ipcRenderer.send(
+      'peard:get-queue-response',
+      {
+        items: queue?.queue.getItems(),
+        autoPlaying: queue?.queue.autoPlaying,
+        continuation: queue?.queue.continuation,
+      } satisfies QueueResponse,
+      requestId,
+    );
+  });
+
+  window.ipcRenderer.on('peard:get-queue-slim', (_, requestId?: string) => {
+    const runsText = (value?: { runs?: { text?: string }[] }) =>
+      value?.runs?.map((run) => run.text ?? '').join('') ?? '';
+
+    let response: SlimQueueResponse | undefined;
+    try {
+      const queue = document.querySelector<QueueElement>('#queue');
+      const rawItems = queue?.queue.getItems() ?? [];
+      const items: SlimQueueItem[] = [];
+      let selectedIndex = -1;
+
+      rawItems.forEach((item, index) => {
+        const renderer =
+          item?.playlistPanelVideoRenderer ??
+          item?.playlistPanelVideoWrapperRenderer?.primaryRenderer
+            ?.playlistPanelVideoRenderer;
+        if (!renderer?.videoId) return;
+
+        const selected = renderer.selected === true;
+        if (selected) selectedIndex = index;
+
+        items.push({
+          index,
+          videoId: renderer.videoId,
+          title: runsText(renderer.title).trim(),
+          // The byline is "Artist • Album • Year"; keep only the artist.
+          artist: runsText(renderer.longBylineText ?? renderer.shortBylineText)
+            .split('•')[0]
+            .trim(),
+          thumbnail: renderer.thumbnail?.thumbnails?.at(-1)?.url ?? null,
+          duration: runsText(renderer.lengthText).trim(),
+          selected,
+        });
+      });
+
+      response = {
+        items,
+        total: rawItems.length,
+        selectedIndex,
+        autoPlaying: queue?.queue.autoPlaying,
+      };
+    } catch (err) {
+      console.error(err);
+    }
+
+    window.ipcRenderer.send(
+      'peard:get-queue-slim-response',
+      response,
+      requestId,
+    );
   });
 
   window.ipcRenderer.on(
@@ -283,29 +349,47 @@ async function onApiLoaded() {
 
   window.ipcRenderer.on(
     'peard:search',
-    async (_, query: string, params?: string, continuation?: string) => {
-      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
-      const searchBox =
-        document.querySelector<SearchBoxElement>('ytmusic-search-box');
+    async (
+      _,
+      query: string,
+      params?: string,
+      continuation?: string,
+      requestId?: string,
+    ) => {
+      // Always reply (null on failure) so the requester never hangs.
+      let result: unknown = null;
+      try {
+        const app =
+          document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+        const searchBox =
+          document.querySelector<SearchBoxElement>('ytmusic-search-box');
 
-      if (!app || !searchBox) return;
-
-      const result = await app.networkManager.fetch<
-        unknown,
-        {
-          query: string;
-          params?: string;
-          continuation?: string;
-          suggestStats?: unknown;
+        if (app && searchBox) {
+          result = await app.networkManager.fetch<
+            unknown,
+            {
+              query: string;
+              params?: string;
+              continuation?: string;
+              suggestStats?: unknown;
+            }
+          >('/search', {
+            query,
+            params,
+            continuation,
+            suggestStats: searchBox.getSearchboxStats(),
+          });
         }
-      >('/search', {
-        query,
-        params,
-        continuation,
-        suggestStats: searchBox.getSearchboxStats(),
-      });
+      } catch (err) {
+        console.error(err);
+        result = null;
+      }
 
-      window.ipcRenderer.send('peard:search-results', result);
+      window.ipcRenderer.send(
+        'peard:search-results',
+        result ?? null,
+        requestId,
+      );
     },
   );
 

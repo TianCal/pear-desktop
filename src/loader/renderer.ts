@@ -8,6 +8,16 @@ import type { RendererContext } from '@/types/contexts';
 import type { PluginConfig, PluginDef } from '@/types/plugins';
 
 const unregisterStyleMap: Record<string, (() => void)[]> = {};
+// Disposers of IPC listeners registered through each plugin's context.
+// Keyed by plugin id, because a new context is created for every start/stop call
+const ipcDisposerMap: Record<string, Set<() => void>> = {};
+
+const removePluginIpcListeners = (id: string) => {
+  const disposers = ipcDisposerMap[id];
+  if (!disposers) return;
+  delete ipcDisposerMap[id];
+  disposers.forEach((dispose) => dispose());
+};
 const loadedPluginMap: Record<
   string,
   PluginDef<unknown, unknown, unknown>
@@ -28,10 +38,26 @@ export const createContext = <Config extends PluginConfig>(
     invoke: (event: string, ...args: unknown[]) =>
       window.ipcRenderer.invoke(event, ...args),
     on: (event: string, listener: CallableFunction) => {
-      window.ipcRenderer.on(event, (_, ...args: unknown[]) => {
+      let active = true;
+      const wrapped = (_: unknown, ...args: unknown[]) => {
+        // The listener object may not be removable across the context bridge
+        // (function identity is not preserved), so also guard with a flag
+        if (!active) return;
         // oxlint-disable-next-line typescript/no-unsafe-call
         listener(...args);
-      });
+      };
+      window.ipcRenderer.on(event, wrapped);
+
+      const disposers = (ipcDisposerMap[id] ??= new Set());
+      const dispose = () => {
+        if (!active) return;
+        active = false;
+        ipcDisposerMap[id]?.delete(dispose);
+        window.ipcRenderer.removeListener(event, wrapped);
+      };
+      disposers.add(dispose);
+
+      return dispose;
     },
     removeAllListeners: (event: string) => {
       window.ipcRenderer.removeAllListeners(event);
@@ -52,6 +78,9 @@ export const forceUnloadRendererPlugin = async (id: string) => {
     ctx: 'renderer',
     context: createContext(id),
   });
+  // Only a plugin whose `stop` ran is really unloaded; one without `stop`
+  // keeps running until restart and still needs its listeners
+  if (hasStopped) removePluginIpcListeners(id);
   if (plugin?.stylesheets) {
     document.querySelector(`style#plugin-${id}`)?.remove();
   }
@@ -105,6 +134,8 @@ export const forceLoadRendererPlugin = async (id: string) => {
       t('common.console.plugins.loaded', { pluginName: id }),
     );
   } else {
+    // Don't leak listeners registered before the failure
+    removePluginIpcListeners(id);
     console.log(
       LoggerPrefix,
       t('common.console.plugins.initialize-failed', { pluginName: id }),

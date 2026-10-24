@@ -5,9 +5,10 @@ import { createServer as createHttpsServer } from 'node:https';
 import { serve, upgradeWebSocket } from '@hono/node-server';
 import { swaggerUI } from '@hono/swagger-ui';
 import { OpenAPIHono as Hono } from '@hono/zod-openapi';
+import { ipcMain } from 'electron';
 import { cors } from 'hono/cors';
 import { jwt } from 'hono/jwt';
-import { WebSocketServer } from 'ws';
+import { type WebSocket, WebSocketServer } from 'ws';
 
 import { APPLICATION_NAME } from '@/i18n';
 import { registerCallback } from '@/providers/song-info';
@@ -27,16 +28,46 @@ import type {
 } from '@/types/datahost-get-state';
 import type { MiddlewareHandler } from 'hono';
 
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+const needsRestart = (old: APIServerConfig, config: APIServerConfig) =>
+  old.hostname !== config.hostname ||
+  old.port !== config.port ||
+  old.useHttps !== config.useHttps ||
+  old.certPath !== config.certPath ||
+  old.keyPath !== config.keyPath;
+
+// Live WS clients were authenticated against the old auth settings.
+const authChanged = (old: APIServerConfig, config: APIServerConfig) =>
+  old.authStrategy !== config.authStrategy ||
+  old.secret !== config.secret ||
+  old.authorizedClients.some((id) => !config.authorizedClients.includes(id));
+
 export const backend = createBackend<BackendType, APIServerConfig>({
   async start(ctx) {
     const config = await ctx.getConfig();
+    this.setCachedConfig(config);
+    this.oldConfig = config;
+    this.cleanups = [];
 
     this.init(ctx);
-    registerCallback((songInfo) => {
-      this.songInfo = songInfo;
-    });
+    this.cleanups.push(
+      registerCallback((songInfo) => {
+        this.songInfo = songInfo;
+      }),
+    );
 
-    ctx.ipc.on('peard:player-api-loaded', () => {
+    const on = <A extends unknown[]>(
+      channel: string,
+      listener: (...args: A) => void,
+    ) => {
+      const wrapped = (_: Electron.IpcMainEvent, ...args: unknown[]) =>
+        listener(...(args as A));
+      ipcMain.on(channel, wrapped);
+      this.cleanups.push(() => ipcMain.removeListener(channel, wrapped));
+    };
+
+    on('peard:player-api-loaded', () => {
       ctx.ipc.send('peard:setup-seeked-listener');
       ctx.ipc.send('peard:setup-time-changed-listener');
       ctx.ipc.send('peard:setup-repeat-changed-listener');
@@ -45,39 +76,64 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       ctx.ipc.send('peard:setup-shuffle-changed-listener');
     });
 
-    ctx.ipc.on(
-      'peard:repeat-changed',
-      (mode: RepeatMode) => (this.currentRepeatMode = mode),
-    );
+    on('peard:repeat-changed', (mode: RepeatMode) => {
+      this.currentRepeatMode = mode;
+    });
 
-    ctx.ipc.on(
-      'peard:volume-changed',
-      (newVolumeState: VolumeState) => (this.volumeState = newVolumeState),
-    );
+    on('peard:volume-changed', (newVolumeState: VolumeState) => {
+      this.volumeState = newVolumeState;
+    });
 
     this.run(config);
   },
   stop() {
+    for (const cleanup of this.cleanups.splice(0)) {
+      try {
+        cleanup();
+      } catch (err) {
+        console.error(err);
+      }
+    }
     this.end();
   },
   onConfigChange(config) {
     const old = this.oldConfig;
-    if (
-      old?.hostname === config.hostname &&
-      old?.port === config.port &&
-      old?.useHttps === config.useHttps &&
-      old?.certPath === config.certPath &&
-      old?.keyPath === config.keyPath
-    ) {
-      this.oldConfig = config;
+    this.setCachedConfig(config);
+    this.oldConfig = config;
+
+    if (old && !needsRestart(old, config)) {
+      if (authChanged(old, config)) this.closeSockets(1008, 'Auth changed');
       return;
     }
 
     this.end();
     this.run(config);
-    this.oldConfig = config;
   },
 
+  // Custom
+  cleanups: [],
+  setCachedConfig(config) {
+    this.config = config;
+    this.authorizedClients = new Set(config.authorizedClients);
+  },
+  getJwtMiddleware(secret) {
+    if (this.jwtMiddleware?.secret !== secret) {
+      this.jwtMiddleware = {
+        secret,
+        handler: jwt({ secret, alg: 'HS256' }),
+      };
+    }
+    return this.jwtMiddleware.handler;
+  },
+  closeSockets(code, reason) {
+    this.wss?.clients.forEach((socket) => {
+      try {
+        socket.close(code, reason);
+      } catch {
+        socket.terminate();
+      }
+    });
+  },
   // Custom
   init(backendCtx) {
     this.app = new Hono();
@@ -91,18 +147,22 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     });
 
     // middlewares
+    // Config is cached (kept fresh by onConfigChange) instead of being read
+    // from the store on every request.
+    const getCachedConfig = async () => {
+      if (!this.config) this.setCachedConfig(await backendCtx.getConfig());
+      return this.config!;
+    };
+
     const jwtGuard: MiddlewareHandler = async (ctx, next) => {
       if (ctx.req.path.endsWith(`${API_VERSION}/ws`)) {
         return await next();
       }
 
-      const config = await backendCtx.getConfig();
+      const config = await getCachedConfig();
 
       if (config.authStrategy !== AuthStrategy.NONE) {
-        return await jwt({
-          secret: config.secret,
-          alg: 'HS256',
-        })(ctx, next);
+        return await this.getJwtMiddleware(config.secret)(ctx, next);
       }
       return await next();
     };
@@ -112,12 +172,23 @@ export const backend = createBackend<BackendType, APIServerConfig>({
         return await next();
       }
 
-      const result = await JWTPayloadSchema.spa(await ctx.get('jwtPayload'));
-      const config = await backendCtx.getConfig();
+      const config = await getCachedConfig();
+      if (config.authStrategy === AuthStrategy.NONE) {
+        return await next();
+      }
 
-      const isAuthorized =
-        config.authStrategy === AuthStrategy.NONE ||
-        (result.success && config.authorizedClients.includes(result.data.id));
+      const result = await JWTPayloadSchema.spa(await ctx.get('jwtPayload'));
+
+      let isAuthorized =
+        result.success && !!this.authorizedClients?.has(result.data.id);
+      if (result.success && !isAuthorized) {
+        // A client may have just been authorized via /auth; re-read the
+        // store in case the change has not reached onConfigChange yet.
+        this.setCachedConfig(await backendCtx.getConfig());
+        isAuthorized =
+          this.config?.authStrategy === AuthStrategy.NONE ||
+          !!this.authorizedClients?.has(result.data.id);
+      }
       if (!isAuthorized) {
         ctx.status(401);
         return ctx.body('Unauthorized');
@@ -139,7 +210,9 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       () => this.volumeState,
     );
     registerAuth(this.app, backendCtx);
-    registerWebsocket(this.app, backendCtx, upgradeWebSocket);
+    this.cleanups.push(
+      registerWebsocket(this.app, backendCtx, upgradeWebSocket),
+    );
 
     // swagger
     this.app.openAPIRegistry.registerComponent(
@@ -195,12 +268,44 @@ export const backend = createBackend<BackendType, APIServerConfig>({
             };
 
       this.server = serve(serveOptions);
+      this.wss = wss;
+
+      // Heartbeat: drop sockets that did not answer the previous ping.
+      const alive = new WeakSet<WebSocket>();
+      wss.on('connection', (socket) => {
+        alive.add(socket);
+        socket.on('pong', () => alive.add(socket));
+      });
+      this.heartbeat = setInterval(() => {
+        wss.clients.forEach((socket) => {
+          if (!alive.has(socket)) {
+            socket.terminate();
+            return;
+          }
+          alive.delete(socket);
+          try {
+            socket.ping();
+          } catch {
+            socket.terminate();
+          }
+        });
+      }, HEARTBEAT_INTERVAL_MS);
     } catch (err) {
       console.error(err);
     }
   },
   end() {
-    this.server?.close();
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+
+    this.closeSockets(1001, 'Server shutting down');
+    this.wss = undefined;
+
+    const server = this.server;
     this.server = undefined;
+    server?.close();
+    if (server && 'closeAllConnections' in server) {
+      server.closeAllConnections();
+    }
   },
 });

@@ -1,5 +1,5 @@
 import { createRoute, z } from '@hono/zod-openapi';
-import { app as electronApp } from 'electron';
+import { app as electronApp, ipcMain } from 'electron';
 import { verify } from 'hono/jwt';
 
 import {
@@ -42,7 +42,7 @@ type PlayerState = {
 
 export const register = (
   app: HonoApp,
-  { getConfig, ipc }: BackendContext<APIServerConfig>,
+  { getConfig }: BackendContext<APIServerConfig>,
   uws: typeof upgradeWebSocket,
 ) => {
   let volumeState: VolumeState | undefined = undefined;
@@ -51,11 +51,27 @@ export const register = (
   let lastSongInfo: SongInfo | undefined = undefined;
 
   const sockets = new Set<WSContext<WebSocketLike>>();
+  const cleanups: (() => void)[] = [];
+  let lastSentPosition: number | undefined = undefined;
 
   const send = (type: DataTypes, state: Partial<PlayerState>) => {
-    sockets.forEach((socket) =>
-      socket.send(JSON.stringify({ type, ...state })),
-    );
+    if (type === DataTypes.PositionChanged) {
+      // Skip ticks that do not move the position
+      if (state.position === lastSentPosition) return;
+    }
+    if (state.position !== undefined) lastSentPosition = state.position;
+
+    if (sockets.size === 0) return;
+
+    // Serialize once per broadcast, not once per socket
+    const message = JSON.stringify({ type, ...state });
+    sockets.forEach((socket) => {
+      try {
+        socket.send(message);
+      } catch (err) {
+        console.error(LoggerPrefix, 'WebSocket send failed:', err);
+      }
+    });
   };
 
   const createPlayerState = ({
@@ -78,14 +94,26 @@ export const register = (
     shuffle,
   });
 
-  electronApp.once('before-quit', () => {
+  const onBeforeQuit = () => {
     send(DataTypes.PlayerStateChanged, {
       isPlaying: false,
       position: lastSongInfo?.elapsedSeconds ?? 0,
     });
-  });
+  };
+  electronApp.once('before-quit', onBeforeQuit);
+  cleanups.push(() => electronApp.removeListener('before-quit', onBeforeQuit));
 
-  registerCallback((songInfo, event) => {
+  const on = <A extends unknown[]>(
+    channel: string,
+    listener: (...args: A) => void,
+  ) => {
+    const wrapped = (_: Electron.IpcMainEvent, ...args: unknown[]) =>
+      listener(...(args as A));
+    ipcMain.on(channel, wrapped);
+    cleanups.push(() => ipcMain.removeListener(channel, wrapped));
+  };
+
+  const unregisterSongInfo = registerCallback((songInfo, event) => {
     if (event === SongInfoEvent.VideoSrcChanged) {
       send(DataTypes.VideoChanged, { song: songInfo, position: 0 });
     }
@@ -103,8 +131,9 @@ export const register = (
 
     lastSongInfo = { ...songInfo };
   });
+  cleanups.push(unregisterSongInfo);
 
-  ipc.on('peard:volume-changed', (newVolumeState: VolumeState) => {
+  on('peard:volume-changed', (newVolumeState: VolumeState) => {
     volumeState = newVolumeState;
     send(DataTypes.VolumeChanged, {
       volume: volumeState.state,
@@ -112,16 +141,16 @@ export const register = (
     });
   });
 
-  ipc.on('peard:repeat-changed', (mode: RepeatMode) => {
+  on('peard:repeat-changed', (mode: RepeatMode) => {
     repeat = mode;
     send(DataTypes.RepeatChanged, { repeat });
   });
 
-  ipc.on('peard:seeked', (t: number) => {
+  on('peard:seeked', (t: number) => {
     send(DataTypes.PositionChanged, { position: t });
   });
 
-  ipc.on('peard:shuffle-changed', (newShuffle: boolean) => {
+  on('peard:shuffle-changed', (newShuffle: boolean) => {
     shuffle = newShuffle;
     send(DataTypes.ShuffleChanged, { shuffle });
   });
@@ -163,14 +192,22 @@ export const register = (
 
           try {
             const payload = await verify(token, config.secret, 'HS256');
-            const parsedPayload = await JWTPayloadSchema.safeParseAsync(payload);
+            const parsedPayload =
+              await JWTPayloadSchema.safeParseAsync(payload);
 
-            if (!parsedPayload.success || !config.authorizedClients.includes(parsedPayload.data.id)) {
+            if (
+              !parsedPayload.success ||
+              !config.authorizedClients.includes(parsedPayload.data.id)
+            ) {
               ws.close(1008, 'Unauthorized');
               return;
             }
           } catch (err) {
-            console.error(LoggerPrefix, 'WebSocket authentication failed:', err);
+            console.error(
+              LoggerPrefix,
+              'WebSocket authentication failed:',
+              err,
+            );
             ws.close(1008, 'Unauthorized');
             return;
           }
@@ -196,4 +233,9 @@ export const register = (
       },
     })) as (ctx: Context, next: Next) => Promise<Response>,
   );
+
+  return () => {
+    for (const cleanup of cleanups.splice(0)) cleanup();
+    sockets.clear();
+  };
 };

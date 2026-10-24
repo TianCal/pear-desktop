@@ -1,5 +1,5 @@
 import { deepmerge } from 'deepmerge-ts';
-import { allPlugins } from 'virtual:plugins';
+import { allPlugins, fullPlugin } from 'virtual:plugins';
 
 import * as config from '@/config';
 import { t } from '@/i18n';
@@ -39,7 +39,9 @@ const createContext = (
 
 export const forceLoadMenuPlugin = async (id: string, win: BrowserWindow) => {
   try {
-    const plugin = (await allPlugins())[id];
+    // The stubs from allPlugins() don't include the menu, so import the full
+    // plugin (only enabled plugins' menus are loaded)
+    const plugin = await fullPlugin(id);
     if (!plugin) return;
 
     const menu = plugin.menu?.(createContext(id, win));
@@ -70,16 +72,19 @@ export const forceLoadMenuPlugin = async (id: string, win: BrowserWindow) => {
 export const loadAllMenuPlugins = async (win: BrowserWindow) => {
   const pluginConfigs = config.plugins.getPlugins();
 
-  for (const [pluginId, pluginDef] of Object.entries(await allPlugins())) {
-    const config = deepmerge(
-      pluginDef.config ?? { enabled: false },
-      pluginConfigs[pluginId] ?? {},
-    );
+  // Menu templates are stored per plugin id, so they can be built concurrently
+  await Promise.all(
+    Object.entries(await allPlugins()).map(async ([pluginId, pluginDef]) => {
+      const config = deepmerge(
+        pluginDef.config ?? { enabled: false },
+        pluginConfigs[pluginId] ?? {},
+      );
 
-    if (config.enabled) {
-      await forceLoadMenuPlugin(pluginId, win);
-    }
-  }
+      if (config.enabled) {
+        await forceLoadMenuPlugin(pluginId, win);
+      }
+    }),
+  );
 };
 
 export const getMenuTemplate = (
