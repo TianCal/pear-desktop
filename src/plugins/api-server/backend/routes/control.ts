@@ -20,6 +20,7 @@ import {
   LibraryPlaylistsQuerySchema,
   MoveSongInQueueSchema,
   PlaylistParamsSchema,
+  PlaySongSchema,
   QueueParamsSchema,
   SearchSchema,
   SeekSchema,
@@ -516,6 +517,46 @@ const routes = {
       },
     },
   }),
+  playSong: createRoute({
+    method: 'post',
+    path: `/api/${API_VERSION}/queue/play`,
+    summary: 'play a song now',
+    description:
+      'Insert a song after the playing track and start playing it, in one step. Replies with its queue slot and the video id in it, which YouTube Music may have resolved to another.',
+    request: {
+      body: {
+        description: 'video id of the song to play',
+        content: {
+          'application/json': {
+            schema: PlaySongSchema,
+          },
+        },
+      },
+    },
+    responses: {
+      200: {
+        description: 'Success',
+        content: {
+          'application/json': {
+            schema: z.object({ index: z.number(), videoId: z.string() }),
+          },
+        },
+      },
+      400: {
+        description: 'Not a video id',
+      },
+      422: {
+        description: 'YouTube Music gave nothing to queue for that video',
+      },
+      503: {
+        description:
+          'Player window is not available, or YouTube Music could not be asked',
+      },
+      504: {
+        description: 'Player did not respond in time',
+      },
+    },
+  }),
   moveSongInQueue: createRoute({
     method: 'patch',
     path: `/api/${API_VERSION}/queue/{index}`,
@@ -1000,6 +1041,28 @@ export const register = (
 
     ctx.status(204);
     return ctx.body(null);
+  });
+  app.openapi(routes.playSong, async (ctx) => {
+    const { videoId } = ctx.req.valid('json');
+    let played: { index: number; videoId?: string };
+    try {
+      played = await controller.playSong(videoId);
+    } catch (err) {
+      // A late renderer may still have changed the queue.
+      invalidateQueue();
+      return rendererError(ctx, err);
+    }
+    invalidateQueue();
+
+    if (played.index < 0) {
+      ctx.status(played.index === -1 ? 422 : 503);
+      return ctx.body(null);
+    }
+    ctx.status(200);
+    return ctx.json({
+      index: played.index,
+      videoId: played.videoId ?? videoId,
+    });
   });
   app.openapi(routes.moveSongInQueue, (ctx) => {
     const index = Number(ctx.req.param('index'));

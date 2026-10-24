@@ -68,6 +68,43 @@ const waitFor = async (check: () => boolean, timeout: number) => {
   return check();
 };
 
+/** Queue items for one video, fetched the way YouTube Music's own "Play
+ *  next" does: empty if it gave none, `null` if it could not be asked. */
+const fetchQueueItems = async (
+  app: MusicPlayerAppElement,
+  queueContextParams: unknown,
+  videoId: string,
+  queueInsertPosition: string,
+) => {
+  const result = await app.networkManager
+    .fetch('/music/get_queue', {
+      queueContextParams,
+      queueInsertPosition,
+      videoIds: [videoId],
+    })
+    .catch(() => null);
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    !('queueDatas' in result) ||
+    !Array.isArray(result.queueDatas)
+  ) {
+    return null;
+  }
+  return result.queueDatas
+    .map((it) =>
+      typeof it === 'object' && it && 'content' in it ? it.content : null,
+    )
+    .filter(Boolean);
+};
+
+/** `peard:play-song`'s answer when nothing played: YouTube Music gave
+ *  nothing to queue, or could not be asked (or not in time). The time
+ *  budget stays under the main process's 10 s request timeout. */
+const PLAY_SONG_NOTHING = -1;
+const PLAY_SONG_FAILED = -2;
+const PLAY_SONG_BUDGET_MS = 8000;
+
 /** A playlist's tracks in order, as queue items; empty if it has none. */
 const fetchPlaylist = async (
   app: MusicPlayerAppElement,
@@ -372,49 +409,88 @@ async function onApiLoaded() {
       const store = queue?.queue.store.store;
       if (!store) return;
 
-      app.networkManager
-        .fetch('/music/get_queue', {
-          queueContextParams: store.getState().queue.queueContextParams,
-          queueInsertPosition,
-          videoIds: [videoId],
-        })
-        .then((result) => {
-          if (
-            result &&
-            typeof result === 'object' &&
-            'queueDatas' in result &&
-            Array.isArray(result.queueDatas)
-          ) {
-            const queueItems = store.getState().queue.items;
-            const queueItemsLength = queueItems.length ?? 0;
-            queue?.dispatch({
-              type: 'ADD_ITEMS',
-              payload: {
-                nextQueueItemId: store.getState().queue.nextQueueItemId,
-                index:
-                  queueInsertPosition === 'INSERT_AFTER_CURRENT_VIDEO'
-                    ? queueItems.findIndex(
-                        (it) =>
-                          (
-                            it.playlistPanelVideoRenderer ||
-                            it.playlistPanelVideoWrapperRenderer
-                              ?.primaryRenderer.playlistPanelVideoRenderer
-                          )?.selected,
-                      ) + 1 || queueItemsLength
-                    : queueItemsLength,
-                items: result.queueDatas
-                  .map((it) =>
-                    typeof it === 'object' && it && 'content' in it
-                      ? it.content
-                      : null,
-                  )
-                  .filter(Boolean),
-                shuffleEnabled: false,
-                shouldAssignIds: true,
-              },
-            });
-          }
+      fetchQueueItems(
+        app,
+        store.getState().queue.queueContextParams,
+        videoId,
+        queueInsertPosition,
+      ).then((items) => {
+        if (!items?.length) return;
+        const queueItems = store.getState().queue.items;
+        const queueItemsLength = queueItems.length ?? 0;
+        queue?.dispatch({
+          type: 'ADD_ITEMS',
+          payload: {
+            nextQueueItemId: store.getState().queue.nextQueueItemId,
+            index:
+              queueInsertPosition === 'INSERT_AFTER_CURRENT_VIDEO'
+                ? queueItems.findIndex((it) => queueRenderer(it)?.selected) +
+                    1 || queueItemsLength
+                : queueItemsLength,
+            items,
+            shuffleEnabled: false,
+            shouldAssignIds: true,
+          },
         });
+      });
+    },
+  );
+  window.ipcRenderer.on(
+    'peard:play-song',
+    async (_, videoId: string, requestId?: string) => {
+      // Insert after the playing track and jump to it in one go, so a client
+      // never has to poll the queue for the insert to land. Replies with the
+      // slot now playing and the video it holds (YouTube Music can resolve
+      // an id to another), or an index of PLAY_SONG_NOTHING/_FAILED.
+      const reply = (index: number, playing?: string) =>
+        window.ipcRenderer.send(
+          'peard:play-song-response',
+          { index, videoId: playing },
+          requestId,
+        );
+      const started = performance.now();
+
+      const queue = document.querySelector<QueueElement>('#queue');
+      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+      const store = queue?.queue.store.store;
+      if (!app || !queue || !store) return reply(PLAY_SONG_FAILED);
+
+      const items = await fetchQueueItems(
+        app,
+        store.getState().queue.queueContextParams,
+        videoId,
+        'INSERT_AFTER_CURRENT_VIDEO',
+      );
+      if (!items) return reply(PLAY_SONG_FAILED);
+      if (!items.length) return reply(PLAY_SONG_NOTHING);
+      // The requester has given up by now: playing it anyway would surprise
+      // whoever retries, with a second copy in the queue.
+      if (performance.now() - started > PLAY_SONG_BUDGET_MS) {
+        return reply(PLAY_SONG_FAILED);
+      }
+
+      // Read after the fetch: the queue may have moved on while it was out.
+      const queueItems = store.getState().queue.items;
+      const index =
+        queueItems.findIndex((it) => queueRenderer(it)?.selected) + 1 ||
+        queueItems.length;
+      queue.dispatch({
+        type: 'ADD_ITEMS',
+        payload: {
+          nextQueueItemId: store.getState().queue.nextQueueItemId,
+          index,
+          items,
+          shuffleEnabled: false,
+          shouldAssignIds: true,
+        },
+      });
+      // The item that is the song asked for, should YouTube hand over more.
+      const videoIds = items.map(
+        (it) => queueRenderer(it as QueueItem)?.videoId,
+      );
+      const own = Math.max(0, videoIds.indexOf(videoId));
+      queue.dispatch({ type: 'SET_INDEX', payload: index + own });
+      reply(index + own, videoIds[own] ?? videoId);
     },
   );
   window.ipcRenderer.on(

@@ -11,6 +11,9 @@ export const AddSongToQueueSchema = z.object({
     .optional()
     .default('INSERT_AT_END'),
 });
+export const PlaySongSchema = z.object({
+  videoId: z.string().regex(/^[\w-]+$/),
+});
 export const MoveSongInQueueSchema = z.object({
   toIndex: z.number(),
 });

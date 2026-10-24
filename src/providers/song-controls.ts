@@ -265,6 +265,20 @@ export const getSongControls = (win: BrowserWindow) => {
 
       win.webContents.send('peard:remove-from-queue', indexValue);
     },
+    /**
+     * Resolves with the slot the song was inserted at (after the playing
+     * track) and is now playing, and the video it holds. The index is -1 if
+     * YouTube Music gave nothing to queue and -2 if it could not be asked in
+     * time. Rejects with a {@link RendererRequestError} on timeout.
+     */
+    playSong: (videoId: string) =>
+      requestFromRenderer<{ index: number; videoId?: string }>(
+        win,
+        'peard:play-song',
+        'peard:play-song-response',
+        [videoId],
+        RENDERER_SEARCH_TIMEOUT_MS,
+      ),
     setQueueIndex: (index: ArgsType<number>) => {
       const indexValue = parseNumberFromArgsType(index);
       if (indexValue === null) return;
