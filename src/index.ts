@@ -359,6 +359,8 @@ async function createMainWindow() {
     delete decorations.titleBarStyle;
   }
 
+  const startVisible = config.get('options.appVisible');
+
   const electronWindowSettings: Electron.BrowserWindowConstructorOptions = {
     icon,
     width: windowSize.width,
@@ -367,6 +369,10 @@ async function createMainWindow() {
     minHeight: 425,
     backgroundColor: '#000',
     show: false,
+    // When starting hidden in the tray, keep the page hidden until the window
+    // is shown. Otherwise Electron marks it visible on its first paint and it
+    // keeps rendering frames with no window on screen.
+    paintWhenInitiallyHidden: startVisible,
     webPreferences: {
       contextIsolation: true,
       preload: path.join(__dirname, '..', 'preload', 'preload.cjs'),
@@ -495,6 +501,14 @@ async function createMainWindow() {
       win.show();
     }
   });
+
+  if (!startVisible) {
+    // Electron skips 'ready-to-show' for a page that doesn't paint while
+    // hidden, so fire it once the DOM is ready for the plugins waiting on it
+    win.webContents.once('dom-ready', () => {
+      win.emit('ready-to-show');
+    });
+  }
 
   removeContentSecurityPolicy();
 
